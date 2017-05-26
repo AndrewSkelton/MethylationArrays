@@ -1,0 +1,248 @@
+---
+title: "R 450K - Data from Matlock, Analysis for Louise"
+output: html_notebook
+---
+
+
+```{r load_libs, message=FALSE}
+source("http://bioconductor.org/biocLite.R")
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(minfi)
+library(shinyMethyl)
+library(limma)
+library(statmod)
+```
+
+
+```{r set_phenotype}
+raw_idat    <- list.files("../raw_data/") %>% gsub("_Red.idat","",.) %>% gsub("_Grn.idat","",.) %>% unique
+pheno_in    <- read_tsv("../pheno/pheno.txt") %>% as.data.frame %>% 
+               mutate(SentrixID = gsub("R","R0",SentrixID),
+                      SentrixID = gsub("C","C0",SentrixID),
+                      Basename  = paste0("../raw_data/",SentrixID)) %>% 
+               dplyr::slice(match(raw_idat,SentrixID)) %>% 
+               filter(PatientID != "P1", PatientID != "P6") %>% 
+               arrange(PatientID)
+pheno_in;raw_idat
+```
+
+```{r gender_targets}
+gender_targets <- c("cg27540865","cg20926353","cg00167275","cg16218221","cg08656326",
+                    "cg06358300","cg00804338","cg11955727","cg12691488","cg00399683",
+                    "cg14095100","cg26921482","cg00500229")
+```
+
+
+```{r read_in_raw}
+raw_data                <- read.metharray.exp(targets = pheno_in)
+det_pval                <- raw_data %>% detectionP(type = "m+u")
+det_pval_fail           <- det_pval > 0.01
+det_pval_remove         <- names(which(rowMeans(det_pval_fail)>0.5, TRUE))
+```
+
+
+```{r qc_raw}
+# summary                 <- shinySummarize(raw_data)
+# runShinyMethyl(summary)
+```
+
+
+```{r normalisation}
+set.seed(73)
+norm_data               <- raw_data %>% preprocessFunnorm
+# norm_data               <- raw_data %>% preprocessIllumina %>% mapToGenome
+```
+
+
+```{r probe_filter}
+Mvals               <- norm_data %>% getM
+Bvals               <- norm_data %>% getBeta
+
+# Multimapping data available here:
+# https://github.com/sirselim/illumina450k_filtering/
+mutimappers         <- read_tsv("../Reference/HumanMethylation450_hg19_bowtie_multimap.txt", 
+                                col_types=cols(), col_names = F) %>% 
+                       .$X1 %>% unique
+crossreact          <- read_csv("../Reference/crossreact-probes-Illumina450k.csv", 
+                                col_types=cols()) %>% 
+                       .$TargetID %>% unique
+cpg_remove_mmcr     <- c(mutimappers,crossreact) %>% unique
+
+# Remove Infinite values as an artifact of functional
+# normalisation
+remove_pos          <- which(Mvals==Inf, arr.ind=TRUE)[,1]
+remove_neg          <- which(Mvals==-Inf, arr.ind=TRUE)[,1]
+remove              <- c(remove_pos,remove_neg) %>% unique
+
+# Remove probes where there's a lack of base variability
+# Quite an extreme step, particularly if there are additional
+# sources of variability
+beta_thres          <- (Bvals > 0.8 | Bvals < 0.2) %>% 
+                       apply(., 1, all) %>% 
+                       .[. == T] %>% 
+                       names
+# 
+
+# Find positions of all probes to remove
+remove              <- c(remove,match(unique(c(det_pval_remove,beta_thres,cpg_remove_mmcr)),
+                                      rownames(norm_data))) %>% 
+                       unique %>% na.omit
+
+# Remove all filtered probes
+if(length(remove) > 0) {
+  norm_data_f       <- norm_data[-remove,]
+}else{
+  norm_data_f       <- norm_data
+}
+
+manifest            <- raw_data %>% getManifest
+norm_data_f         <- norm_data_f %>% addSnpInfo
+norm_data_f         <- norm_data_f %>% dropLociWithSnps(., snps = c("SBE","CpG","Probe"), maf  = 0.05)
+annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+norm_data_f         <- norm_data_f[-grep("chrX|chrY", annotation$chr),]
+annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+```
+
+
+```{r pca_v1}
+var_of_interest     <- c("ChipID","PatientID","Sex","SampleType","Extraction","Position")
+pca                 <- norm_data_f %>% getM %>% na.omit %>% t %>% prcomp
+d                   <- pca$x %>% as.data.frame %>% add_rownames("SentrixID") %>% 
+                       left_join((pData(norm_data_f) %>% as.data.frame)) %>% 
+                       mutate_each_(funs(as.factor),var_of_interest) %>% 
+                       as.data.frame
+pcv                 <- round((pca$sdev)^2 / sum(pca$sdev^2)*100, 2)
+
+for(i in var_of_interest) {
+  gg                  <- ggplot(d, aes(PC1,PC2)) +
+                         geom_point(aes_string(colour = i)) + 
+                         theme_bw() +
+                         ggtitle(paste0("PCA - ",i)) +
+                         theme(axis.title.x    = element_text(size=15),
+                               axis.title.y    = element_text(size=15)) +
+                         xlab(label = paste0("PC1 (", pcv[1], "%)")) +
+                         ylab(label = paste0("PC2 (", pcv[2], "%)"))
+    
+  print(gg)
+  
+  png(paste0("../Analysis/PCA_",i,".png"),
+    width  = 6.98,height = 6.98,
+    units  = "in",res    = 600)
+  print(gg); dev.off()
+}
+
+```
+
+
+```{r model_fit, cache=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+pheno_in             <- pheno_in %>% mutate_each(funs(as.factor), ChipID)
+mVal                 <- getM(norm_data_f)
+bVal                 <- getBeta(norm_data_f)
+design               <- model.matrix(~0 + SampleType, data = pheno_in)
+block_in             <- pheno_in$PatientID %>% factor
+corfit               <- duplicateCorrelation(mVal, design, block = block_in)
+# corfitb              <- duplicateCorrelation(bVal, design, block = block_in)
+Var_Levels           <- pheno_in$SampleType %>% factor %>% levels
+colnames(design)     <- colnames(design) %>% gsub("SampleType","",.)
+cont                 <- c("NOA_OA"   = "nonOA-OA")
+cont_mat             <- makeContrasts(contrasts = cont, levels = colnames(design))
+colnames(cont_mat)   <- names(cont)
+cont_vec             <- cont %>% gsub("-","_Vs_",.)
+fitm                 <- lmFit(mVal, design, block = block_in, correlation = corfit$consensus) %>% contrasts.fit(cont_mat) %>% eBayes
+fitb                 <- lmFit(bVal, design, block = block_in, correlation = corfit$consensus) %>% contrasts.fit(cont_mat) %>% eBayes
+# fitm                 <- lmFit(mVal, design) %>% eBayes
+# fitb                 <- lmFit(bVal, design) %>% eBayes
+# fitm                 <- lmFit(mVal, design) %>% contrasts.fit(cont_mat) %>% eBayes
+# fitb                 <- lmFit(bVal, design) %>% contrasts.fit(cont_mat) %>% eBayes
+contrasts            <- colnames(cont_mat)
+pVal                 <- 0.01
+fc                   <- 0.1
+```
+
+
+```{r Results, cache=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+ttm                  <- topTable(fitm, coef = names(cont_vec)[1], number = Inf, p.value = pVal) %>% 
+                        as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,`adj.P.Val`)
+ttb                  <- topTable(fitb, coef = names(cont_vec)[1], number = Inf) %>% 
+                        as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,Delta_Beta = logFC)
+tt                   <- ttm %>% left_join(ttb) %>% filter(abs(Delta_Beta) > fc) %>% 
+                                left_join(annotation, by = c("CpG" = "Name"))
+tt
+
+# tt %>% arrange(desc(abs(Delta_Beta)))
+# tt %>% filter(grepl("ACAN", UCSC_RefGene_Name))
+# tt %>% filter(grepl("^COL", UCSC_RefGene_Name))
+# df_in       <- bVal %>% as.data.frame %>% add_rownames("CpG") %>% 
+#                dplyr::slice(match(tt$CpG,CpG))
+# write_tsv(tt, path = "../Analysis/Differential_Methylation_Matlock.txt")
+# write_tsv(df_in, path = "../Analysis/Differential_Methylation_Matlock_Betas.txt")
+# write_tsv(pheno_in, path = "../Analysis/Differential_Methylation_Matlock_pheno.txt")
+```
+
+
+```{r Results_SimplePair, cache=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+ttm                  <- topTable(fitm, coef = "OA", number = Inf, p.value = pVal) %>% 
+                        as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,`adj.P.Val`)
+ttb                  <- topTable(fitb, coef = "OA", number = Inf) %>% 
+                        as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,Delta_Beta = logFC)
+tt                   <- ttm %>% left_join(ttb) %>% filter(abs(Delta_Beta) > fc) %>% 
+                                left_join(annotation, by = c("CpG" = "Name"))
+tt
+tt %>% filter(grepl("ACAN", UCSC_RefGene_Name))
+tt %>% filter(grepl("^COL", UCSC_RefGene_Name))
+
+# write_tsv(tt, path = "../Analysis/Differential_Methylation_MatlockData.txt")
+# foo <- read_csv("../pheno/Supp_Res.csv")
+# ttb                  <- topTable(fitb, coef = "OA_NOA", number = Inf) %>% 
+#                         as.data.frame %>% add_rownames("CpG") %>% filter(abs(logFC) > 0.15, `P.Value` < 0.01)
+# intersect(ttb$CpG, foo$CpG) %>% length
+
+# write_tsv(tt, path = "../Analysis/Differential_Methylation_Matlock.txt")
+# write_tsv(df_in, path = "../Analysis/Differential_Methylation_Matlock_Betas.txt")
+# write_tsv(pheno_in, path = "../Analysis/Differential_Methylation_Matlock_pheno.txt")
+```
+
+
+
+```{r plot_betas, cache=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+tt <- read_tsv("tt_out.txt")
+CpG_to_plot <- tt$CpG[1:5]
+df_in       <- bVal %>% as.data.frame %>% add_rownames("CpG") %>% 
+               dplyr::slice(match(CpG_to_plot,CpG)) %>% melt(value.name = "Beta") %>% 
+               left_join(pheno_in, by = c("variable" = "SentrixID"))
+gg          <- ggplot(df_in, aes(SampleID,y=Beta,group = PatientID, colour = SampleSource)) +
+               geom_point() + theme_bw() + geom_line() +
+               facet_grid(CpG~., scales = "free") +
+               theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(gg)
+
+png("../Analysis/Top_Hits.png",
+    width  = 6.98,height = 6.98,
+    units  = "in",res    = 600)
+print(gg); dev.off()
+```
+
+
+```{r bed_make}
+anno_in    <- annotation %>% dplyr::slice(match(tt$CpG,Name))
+out        <- data.frame(chr = tt$chr) %>% 
+              mutate(start  = tt$pos - 1, end = as.vector(tt$pos), 
+                     name   = paste0(tt$CpG,"_DeltaBeta_",round(tt$Delta_Beta,3)),
+                     score  = as.numeric(tt$Delta_Beta),
+                     strand = as.vector(tt$strand),
+                     box_s  = as.vector(`start`),
+                     box_e  = as.vector(`end`),
+                     colour = ifelse(score < 0, "0,43,255", "255,0,0"))
+
+write_tsv(out, path = "../Analysis/December_Matlock_Jan17.bed", col_names = F)
+exe <- paste0("sed -i '1s/^/track name=\"", 
+              "December_Matlock", "\" description=\"",
+              "December_Matlock", "\" visibility=3 ",
+              "itemRgb=\"On\"",
+              "\\n/' ", 
+              "../Analysis/December_Matlock_Jan17.bed")
+system(exe)
+```

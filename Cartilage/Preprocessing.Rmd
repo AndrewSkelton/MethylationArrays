@@ -1,0 +1,144 @@
+---
+title: "Analysis of Illumina 450K HumanMethylation Data"
+output: html_notebook
+---
+
+
+```{r load_libs, message=FALSE}
+source("http://bioconductor.org/biocLite.R")
+library(tidyverse)
+library(reshape2)
+library(minfi)
+library(shinyMethyl)
+library(limma)
+library(statmod)
+```
+
+
+# Phenotype Data
+The phenotype data was assessed for numerous confounding criteria prior to analysis and tested against original samples. Data was tested for discrepancies in KL score, missing KL data, QC measures, and gender discrepancies. Additionally all PBMC samples were excluded. Two objects are created from the following chunk, analysis ready samples, and samples that were excluded. 
+
+```{r read_pheno_data}
+pheno_in <- read_tsv("../Pheno/pheno_7_qc3.txt", col_types=cols())
+pheno_ex <- pheno_in %>% 
+            filter(KL_Score == "-" | Discrepancy_KL == 1 |
+                   Discrepancy_Other == 1 | Discrepancy_Gender == 1 |
+                   Gender == "ND" | QC_Exclude_3 == 1)
+pheno_in <- pheno_in %>% 
+            filter(KL_Score != "-", Discrepancy_KL != 1,
+                   Discrepancy_Other != 1, Discrepancy_Gender != 1,
+                   Gender != "ND", QC_Exclude_3 != 1) %>% 
+            filter(!grepl("Blood", SampleType)) %>% 
+            mutate(Basename = paste0("../idat/",X1))
+```
+
+
+# IDAT Files
+Read in raw idat files to a genomic ratio set, and calculate detection p value estimates. These estimates can be used in probe level filtering stages. Redundant data objects are removed from memory and the garbage collector called to minimise the memory footprint. 
+
+```{r read_idat}
+raw_idat          <- read.metharray.exp(targets = pheno_in)
+lumi_dpval        <- detectionP(raw_idat, type = "m+u")
+lumi_failed       <- lumi_dpval > 0.01
+lumi_dpval_remove <- names(which(rowMeans(lumi_failed)>0.5, TRUE))
+rm(lumi_dpval, lumi_failed); gc()
+```
+
+
+# QC - Raw Data
+Minfi provides a QC reporting function that creates an external pdf object. A more flexible approach is to use the `ShinyMethyl` package, and it's Shiny interface to query quality metrics such as bisulphide conversion, hybridisation efficiency, amongst others. 
+
+```{r qc_raw}
+# Minfi
+qcReport(raw_idat, 
+         sampNames  = pData(raw_idat)[["Sample ID"]],
+         sampGroups = pData(raw_idat)$SampleType, 
+         pdf        = "qcReport.pdf")
+
+# ShinyMethyl
+summary                 <- shinySummarize(raw_data)
+runShinyMethyl(summary)
+```
+
+
+# Normalisation
+As functional normalisation is a non-deterministic method, the seed should be explicitely set prior to calling. Functional normalisation performs well (better than SWAN), at removing technical variation and preserving global methylation changes. 
+
+
+```{r normalisation}
+set.seed(73)
+norm_data               <- raw_idat %>% preprocessFunnorm(.,
+                                                          nPCs    = 2,
+                                                          sex     = pData(raw_idat)$Gender,
+                                                          bgCorr  = T,
+                                                          dyeCorr = T,
+                                                          verbose = T)
+```
+
+
+# Probe Level Filtering
+There are a number of aspects to the HumanMethylation series of chips that need to be taken into consideration at the probe level to minimise false positives and background noise. 
+
+* Multimapper / Cross reacting probes - A list of probe sequences where the are non-unique are removed to avoid spurious signals. 
+* Infinite Values - An aftifact of functional normalisation where intenities are thought to be at the extreme scale of the beta threshold. These probes are removed, however the +Inf values could be replaced with b1 and -Inf values with b0.
+* An optional step is to remove *non variable* probes, where across all samples their betas are above 0.8, or below 0.2. In this case that threshold is not applied.
+* To avoid events driven by SNPs, a filter is applied to remove any probes where a SNP is present in the CpG, probe sequence or SBE (Single Base Extension), with a MAF threshold of 5%.
+* Sex is a very high driver of variation in methylation experiments, and with a mixed-sex cohort, the sex chromosomes are removed. 
+
+
+```{r probe_filter}
+Mvals               <- norm_data %>% getM
+
+# Multimapping data available here:
+# https://github.com/sirselim/illumina450k_filtering/
+mutimappers         <- read_tsv("./Reference/HumanMethylation450_hg19_bowtie_multimap.txt", col_types=cols(), col_names = F) %>% 
+                       .$X1 %>% unique
+crossreact          <- read_csv("./Reference/crossreact-probes-Illumina450k.csv", col_types=cols()) %>% 
+                       .$TargetID %>% unique
+cpg_remove_mmcr     <- c(mutimappers,crossreact) %>% unique
+
+# Remove Infinite values as an artifact of functional
+# normalisation
+remove              <- which(abs(Mvals)==Inf, arr.ind=TRUE)[,1]
+
+# Remove probes where there's a lack of base variability
+# Quite an extreme step, particularly if there are additional
+# sources of variability
+# beta_thres          <- (Bvals > 0.8 | Bvals < 0.2) %>% 
+#                        apply(., 1, all) %>% 
+#                        .[. == T] %>% 
+#                        names
+# 
+
+# Find positions of all probes to remove
+remove              <- c(remove,match(unique(c(lumi_dpval_remove,cpg_remove_mmcr)),
+                                      rownames(norm_data))) %>% 
+                       unique %>% na.omit
+
+# Remove all filtered probes
+if(length(remove) > 0) {
+  norm_data_f       <- norm_data[-remove,]
+}else{
+  norm_data_f       <- norm_data
+}
+
+norm_data_f         <- norm_data_f %>% addSnpInfo
+norm_data_f         <- norm_data_f %>% dropLociWithSnps(., snps = c("SBE","CpG","Probe"), maf  = 0.05)
+annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+norm_data_f         <- norm_data_f[-grep("chrX|chrY", annotation$chr),]
+annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+
+# Save preprocessed data
+save(norm_data_f,annotation, file = "Preprocessed_Data.RData", compress = T)
+```
+
+
+
+
+
+
+
+
+
+
+
