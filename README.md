@@ -2,6 +2,7 @@
 This repository is a snapshot of cleaned R Markdown scripts used in the analysis of Illumina HumanMethylation 450K bead chips for a cohort of cartilage samples. The primary disease of study is Osteoarthritis
 
 ## Repository Structure
+```
 ├── 01_Preprocessing.Rmd
 ├── 02_Modelling_Differential_Methyl.Rmd
 ├── 03_cAge_Regression.Rmd
@@ -19,6 +20,7 @@ This repository is a snapshot of cleaned R Markdown scripts used in the analysis
 └── Reference
     ├── HumanMethylation450_hg19_bowtie_multimap.txt
     └── crossreact-probes-Illumina450k.csv
+```
 
 * 01_Preprocessing.Rmd - Array preprocessing procedure
 * 02_Modelling_Differential_Methyl.Rmd - Modelling differential methylation between groups
