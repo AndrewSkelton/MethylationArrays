@@ -1,0 +1,179 @@
+---
+title: "Analysis of Illumina 450K HumanMethylation Data"
+output: html_notebook
+---
+
+
+```{r load_libs, message=FALSE}
+source("https://bioconductor.org/biocLite.R")
+library(tidyverse)
+library(reshape2)
+library(minfi)
+library(shinyMethyl)
+library(limma)
+library(statmod)
+library(DMRcate)
+
+# install.packages(c("RPMM", "WGCNA", "sqldf", "impute", "BMIQ", "dynamicTreeCut"))
+library(RPMM)
+library(WGCNA)
+library(sqldf)
+library(impute)
+library(RnBeads)
+library(dynamicTreeCut)
+```
+
+
+# Preprocessing
+At this stage in the analysis it's assumed that there's a `Large GenomicRatioSet` named `norm_data_f`, and an annotation data frame named `annotation`. At the end of the preprocessing notebook, there's the option to save these objects so they can be loaded in here.  
+
+```{r load_preprocessed_data}
+load("Preprocessed_Data.RData")
+```
+
+
+# Hovarth's Methylation Clock
+
+```{r load_essential_functions_and_ref_sets}
+source("Hovarth/NORMALIZATION.R")
+source("Hovarth/Horvath_MethyAge_Normalisation_Functions.R")
+
+probeAnnotation21kdatMethUsed <- read_csv("../Scripts/Hovarth/probeAnnotation21kdatMethUsed.csv")
+probeAnnotation27k            <- read_csv("../Scripts/Hovarth/datMiniAnnotation.csv")
+datClock                      <- read_csv("../Scripts/Hovarth/AdditionalFile3.csv")
+
+trafo      <- function(x, adult.age=20) { 
+  x <- (x+1)/(1+adult.age)
+  y <- ifelse(x<=1, log(x),x-1)
+  y 
+}
+
+anti.trafo <- function(x, adult.age=20) { 
+  ifelse(x<0, 
+         (1+adult.age)*exp(x)-1, 
+         (1+adult.age)*x+adult.age) 
+}
+
+asnumeric1 <- function(x) {
+  as.numeric(as.character(x))
+}
+
+pheno_in          <- pData(norm_data_f) %>% as.data.frame
+mVal              <- getM(norm_data_f)
+design            <- model.matrix(~0 + SampleType + Source, data = pheno_in)
+fitA              <- lmFit(mVal, design)
+mAdj.fit          <- fitA$coefficients[,-c(1:length(unique(pheno_in$SampleType)))]
+mAdj              <- as.matrix(mVal) - mAdj.fit %*% t(design[,-c(1:length(unique(pheno_in$SampleType)))])
+betaAdj           <- ilogit2(mAdj)
+dat0              <- as.data.frame(betaAdj)
+dat0$CpG          <- as.character(rownames(dat0))
+dat0              <- dat0[,c(ncol(dat0), 1:(ncol(dat0)-1))]
+```
+
+
+# Stage 1
+Set up the analysis run with some basic parameters
+
+```{r stage_1}
+nSamples     <- dim(dat0)[[2]]-1
+nProbes      <- dim(dat0)[[1]]
+dat0[,1]     <- gsub(x=dat0 [,1],pattern="\"",replacement="")
+
+match1       <- match(probeAnnotation21kdatMethUsed$Name, dat0[,1])
+dat1         <- dat0[match1,]
+
+set.seed(73)
+```
+
+
+# Stage 2
+Normalise values using BMIQ so that intensities are comparable to the reference sets. This is really really really slow.
+
+```{r stage_2}
+meanMethBySample      <- as.numeric(apply(as.matrix(dat1[,-1]), 2, mean, na.rm=T))
+minMethBySample       <- as.numeric(apply(as.matrix(dat1[,-1]), 2, min,  na.rm=T))
+maxMethBySample       <- as.numeric(apply(as.matrix(dat1[,-1]), 2, max,  na.rm=T))
+
+datMethUsed           <- t(dat1[,-1])
+noMissingPerSample    <- apply(as.matrix(is.na(datMethUsed)), 1, sum)
+gs_in                 <- probeAnnotation21kdatMethUsed$goldstandard2
+
+datMethUsedNormalized <- BMIQcalibration(datM              = datMethUsed, 
+                                         goldstandard.beta = gs_in, 
+                                         plots             = F)
+```
+
+
+# Stage 3
+Gather metrics and make predictions
+
+```{r stage_3}
+selectCpGsClock <- is.element(dimnames(datMethUsedNormalized)[[2]], 
+                              as.character(datClock$CpGmarker[-1]))
+datMethClock0   <- data.frame(datMethUsedNormalized[,selectCpGsClock])
+datMethClock    <- data.frame(datMethClock0[as.character(datClock$CpGmarker[-1])])
+predictedAge    <- as.numeric(anti.trafo(datClock$CoefficientTraining[1] + 
+                                           as.matrix(datMethClock) %*% 
+                                           as.numeric(datClock$CoefficientTraining[-1])))
+
+Comment                      <- ifelse(predictedAge <0, 
+                                       "Negative DNAm age.", 
+                                       ifelse(predictedAge > 100, 
+                                              "Old DNAm age.", 
+                                              rep("",length(predictedAge))))
+Comment[is.na(predictedAge)] <- "Age prediction was not possible. "
+```
+
+
+
+# Stage 4
+Gather output together 
+
+```{r stage_4}
+datout                              <- data.frame(SampleID = colnames(dat1)[-1], 
+                                                  DNAmAge  = predictedAge, 
+                                                  Comment, 
+                                                  noMissingPerSample, 
+                                                  meanMethBySample, 
+                                                  minMethBySample,
+                                                  maxMethBySample)
+
+datout                              <- cbind(datout, as.numeric(pData(lumi.norm.base)$Age))
+datout                              <- cbind(datout, pData(lumi.norm.base)$SampleType)
+colnames(datout)[8:9]               <- c("Chron_Age", "SampleType")
+write.csv(datout, file="Methylation_Age.csv")
+
+pData(lumi.norm.filtered)$MethAge   <- as.numeric(datout$DNAmAge)
+pData(lumi.norm.filtered)$mcAgeDiff <- pData(lumi.norm.filtered)$MethAge - as.numeric(pData(lumi.norm.filtered)$Age)
+```
+
+
+
+```{r plot_cAge_vs_mAge}
+gg <- ggplot(datout, aes(x=Chron_Age, y=DNAmAge, colour=SampleType)) +
+            geom_point() + 
+            theme_bw() + 
+            scale_y_continuous(limits=c(0,100)) +
+            scale_x_continuous(limits=c(0,100)) + 
+            stat_smooth(method    = lm, 
+                        fullrange = T,
+                        se        = F) +
+            geom_abline(intercept = 0) + 
+            facet_grid(SampleType ~ .)
+# png("MethAge_Vs_ChronAge.png",
+#     width  = 12.53, 
+#     height = 6.98, 
+#     units  = "in", 
+#     res    = 600) 
+# print(gg)
+# dev.off()
+```
+
+
+
+
+
+
+
+
+

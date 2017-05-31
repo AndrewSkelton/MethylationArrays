@@ -1,0 +1,234 @@
+---
+title: "Analysis of Illumina 450K HumanMethylation Data"
+output: html_notebook
+---
+
+
+```{r load_libs, message=FALSE}
+source("https://bioconductor.org/biocLite.R")
+library(tidyverse)
+library(reshape2)
+library(minfi)
+library(shinyMethyl)
+library(limma)
+library(statmod)
+library(DMRcate)
+
+# Louise - Amsterdam Slides as PDF
+```
+
+
+# Preprocessing
+At this stage in the analysis it's assumed that there's a `Large GenomicRatioSet` named `norm_data_f`, and an annotation data frame named `annotation`. At the end of the preprocessing notebook, there's the option to save these objects so they can be loaded in here.  
+
+```{r load_preprocessed_data}
+load("Preprocessed_Data.RData")
+```
+
+
+# Model Fit
+Limma is used to design a linear model and fit, integrating a contrast matrix for experimental questions. Two models are fit, one for beta values, and one for M values. The Beta value fit is used to calculate the `delta beta` value, or difference in beta, which is adventageous when building complex models. The M value fit is much better suited to extracting statistics such as the p value, or log odds ratio, as the M value as a measure is homoscedastic, meeting the underlying assumptions of Limma's moderated t-test. 
+
+```{r model_fit, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+pheno_in             <- pData(norm_data_f) %>% as.data.frame
+mVal                 <- getM(norm_data_f)
+bVal                 <- getBeta(norm_data_f)
+design               <- model.matrix(~0 + SampleType + Source, data = pheno_in)
+Var_Levels           <- pheno_in$SampleType %>% factor %>% levels
+colnames(design)     <- colnames(design) %>% gsub("SampleType","",.)
+cont                 <- c("OAHip_OAKnee"      = "Preserved_OA_Hip-Preserved_OA_Knee",
+                          "OAHip_CtHip"       = "Preserved_OA_Hip-Preserved_Control_Hip",
+                          "OAHip_LOAHip"      = "Preserved_OA_Hip-Lesioned_OA_Hip",
+                          "POAKnee_LOAKnee"   = "Preserved_OA_Knee-Lesioned_OA_Knee")
+cont_mat             <- makeContrasts(contrasts = cont, levels = colnames(design))
+colnames(cont_mat)   <- names(cont)
+cont_vec             <- cont %>% gsub("-","_Vs_",.)
+fitm                 <- lmFit(mVal, design) 
+fitb                 <- lmFit(bVal, design)
+fit2m                <- fitm %>% contrasts.fit(cont_mat) %>% eBayes
+fit2b                <- fitb %>% contrasts.fit(cont_mat) %>% eBayes
+contrasts            <- colnames(cont_mat)
+pVal                 <- 0.01
+fc                   <- 0.1
+```
+
+
+
+# Data Adjustments
+Modelling covariates is challanging to interpret, as such the following chunk *removes* the estimated effect of the covariates for a more natural interpretation when visualising the data. 
+
+```{r data_adjustment}
+mAdj.in     <- minfi::getM(norm_data_f)
+mAdj.fit    <- fitm$coefficients[,-c(1:length(unique(pheno_in$SampleType)))]
+mAdj        <- as.matrix(mAdj.in) - mAdj.fit %*% t(design[,-c(1:length(unique(pheno_in$SampleType)))])
+betaAdj     <- ilogit2(mAdj)
+rm(mAdj.in,mAdj.fit); gc()
+```
+
+
+# Differential Methylation Results
+Gathering the results of the differential methylation test means interogating the beta and m value fits, and extracting the relevent values that pass thresholds. Following the gathering of these metrics, annotation is tacked on, and the resulting data frame is added to a list object for referencing. 
+
+
+```{r Results}
+res_out <- list()
+for(i in names(cont_vec)) {
+  ttm                  <- topTable(fit2m, coef = i, number = Inf, p.value = pVal) %>% 
+                          as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,`adj.P.Val`)
+  ttb                  <- topTable(fit2b, coef = i, number = Inf) %>% 
+                          as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,Delta_Beta = logFC)
+  tt                   <- ttm %>% left_join(ttb) %>% filter(abs(Delta_Beta) > fc) %>% 
+                                  left_join(annotation, by = c("CpG" = "Name"))
+  res_out[[i]]         <- tt
+  rm(ttm, ttb); gc()
+  print(tt)
+}
+
+```
+
+
+# Plot Betas
+A Key aspect to assessing the validity of differential methylation calls is to visualise the beta values and categorise the plot by the sample groupings. 
+
+```{r plot_betas, cache=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+tt          <- res_out[[1]]
+CpG_to_plot <- tt$CpG[1:5]
+df_in       <- betaAdj %>% as.data.frame %>% add_rownames("CpG") %>% 
+               dplyr::slice(match(CpG_to_plot,CpG)) %>% melt(value.name = "Beta") %>% 
+               left_join(pheno_in, by = c("variable" = "X1"))
+gg          <- ggplot(df_in, aes(Sample.ID,y=Beta,group = SampleType, colour = SampleType)) +
+               geom_point() + theme_bw() + geom_line() +
+               facet_grid(CpG~SampleType, scales = "free") +
+               theme(axis.text.x = element_text(angle = 90, hjust = 1))
+print(gg)
+
+# png("../Analysis/Top_Hits.png",
+#     width  = 6.98,height = 6.98,
+#     units  = "in",res    = 600)
+# print(gg); dev.off()
+```
+
+
+# Differentially Methylated Regions
+
+```{r DMR_Detection}
+dmr_out <- list()
+for(i in names(cont_vec)) {
+  myannotation       <- cpg.annotate(datatype      = "array",
+                                     what          = "M",
+                                     arraytype     = "450K",
+                                     object        = mVal, 
+                                     analysis.type = "differential", 
+                                     design        = design, 
+                                     coef          = i,
+                                     contrasts     = T, 
+                                     cont.matrix   = cont_mat,
+                                     fdr           = 0.01)
+  dmrcoutput         <- dmrcate(myannotation) 
+  dmrresults         <- dmrcoutput$results %>% 
+                        as.data.frame %>% 
+                        mutate(betaAfc = abs(meanbetafc)) %>% 
+                        filter(betaAfc > 0.1) %>% 
+                        arrange(desc(no.cpgs))
+  dmr_out[[i]]       <- dmrresults
+  print(dmrresults)
+}
+```
+
+
+
+# Plot DMR
+
+```{r plot_dmr, warning=FALSE, message=FALSE}
+for(i in 1:10) {
+  dmrresults           <- dmr_out[[2]]
+  dmr_offset           <- 1000
+  dmr_coords           <- dmrresults$coord[i]
+  dmr_chr              <- strsplit(dmr_coords, ':')[[1]][1]
+  dmr_start            <- as.numeric(strsplit(dmr_coords, '-|:')[[1]][2])
+  dmr_end              <- as.numeric(strsplit(dmr_coords, '-')[[1]][2])
+  dmr_anno             <- annotation %>% 
+                          filter(chr == dmr_chr,
+                                 pos >= (dmr_start - dmr_offset),
+                                 pos <= (dmr_end + dmr_offset))
+  df                   <- betaAdj %>% as.data.frame %>% 
+                          add_rownames("CpG") %>% 
+                          filter(CpG %in% dmr_anno$Name) %>% 
+                          melt %>% dplyr::select(CpG,X1=variable,Beta=value) %>% 
+                          left_join(as.data.frame(pData(norm_data_f))) %>% 
+                          left_join(annotation, by = c("CpG"="Name"))
+  gg                   <- ggplot(df,aes(pos,Beta,colour=SampleType)) +
+                          scale_colour_hue(l = 50) + #geom_point() +
+                          geom_vline(xintercept = c(dmr_start,dmr_end),colour ='red') +
+                          theme_bw() +
+                          stat_summary(fun.y = mean, geom = "line", aes(colour = SampleType, 
+                                       group = SampleType)) +
+                          stat_summary(fun.y = mean, geom = "point", aes(colour = SampleType, 
+                                       group = SampleType)) +
+                          ylim(c(0, 1)) + 
+                          # facet_grid(SampleType~.)+
+                          ggtitle(paste0("DMR Detected: ", dmr_coords))
+  print(gg)
+  
+  # png(paste0("./","DMRPlot",i,".png"),
+  #     width  = 6.98,height = 6.98,
+  #     units  = "in",res    = 600)
+  # print(gg); dev.off()
+}
+```
+
+
+
+
+
+
+# Utility Function - Bed files
+Bed tracks can be useful in epigenetic studies, especially when integrated with other data.
+
+```{r bed_make}
+for(i in 1:length(res_out)) {
+  tt         <- res_out[[i]]
+  anno_in    <- annotation %>% dplyr::slice(match(tt$CpG,Name))
+  out        <- data.frame(chr = tt$chr) %>% 
+                mutate(start  = tt$pos - 1, end = as.vector(tt$pos), 
+                       name   = paste0(tt$CpG,"_DeltaBeta_",round(tt$Delta_Beta,3)),
+                       score  = as.numeric(tt$Delta_Beta),
+                       strand = as.vector(tt$strand),
+                       box_s  = as.vector(`start`),
+                       box_e  = as.vector(`end`),
+                       colour = ifelse(score < 0, "0,43,255", "255,0,0"))
+  
+  write_tsv(out, path = paste0("../Analysis/",names(res_out)[i],".bed"), col_names = F)
+  exe <- paste0("sed -i '1s/^/track name=\"", 
+                "December_Matlock", "\" description=\"",
+                "December_Matlock", "\" visibility=3 ",
+                "itemRgb=\"On\"",
+                "\\n/' ", 
+                "../Analysis/",names(res_out)[i],".bed")
+  system(exe)
+}
+```
+
+
+# Estimate Cell Counts
+
+```{r cellcounts}
+cellcounts <- minfi::estimateCellCounts(raw_data)
+
+df_cc <- cellcounts %>% 
+         melt %>% 
+         left_join(pheno_in, by = c("Var1"= "sentrixID")) 
+          
+gg    <- ggplot(df_cc, aes(Var2,value)) + 
+         geom_point() + 
+         theme_bw() +
+         facet_grid(.~tissue_type, scales="free") +
+         geom_text(aes(label = sample))
+print(gg)
+```
+
+
+
+
+
+

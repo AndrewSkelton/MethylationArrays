@@ -1,0 +1,104 @@
+---
+title: "Analysis of Illumina 450K HumanMethylation Data"
+output: html_notebook
+---
+
+
+```{r load_libs, message=FALSE}
+source("https://bioconductor.org/biocLite.R")
+library(tidyverse)
+library(reshape2)
+library(minfi)
+library(shinyMethyl)
+library(limma)
+library(statmod)
+library(DMRcate)
+```
+
+
+# Preprocessing
+At this stage in the analysis it's assumed that there's a `Large GenomicRatioSet` named `norm_data_f`, and an annotation data frame named `annotation`. At the end of the preprocessing notebook, there's the option to save these objects so they can be loaded in here.  
+
+```{r load_preprocessed_data}
+load("Preprocessed_Data.RData")
+```
+
+
+# Analysis Function
+```{r analysis_function}
+get_age_reg <- function(lvcm_sample, lvcm_in) {
+  if(length(levels(factor(pData(lvcm_in)$Source))) > 1) {
+  lvcm_design <- model.matrix(~(as.numeric(pData(lvcm_in)$Age)) +
+                                pData(lvcm_in)$Source)
+  } else {
+    lvcm_design <- model.matrix(~as.numeric(pData(lvcm_in)$Age))
+  }
+  lvcm_fit    <- lmFit(minfi::getM(lvcm_in), lvcm_design)
+  lvcm_fit2   <- eBayes(lvcm_fit)
+  
+  # Adjust M/B Values for covariates
+  if(length(levels(factor(pData(lvcm_in)$Source))) > 1) {
+    mAdj_in_age     <- minfi::getM(lvcm_in)
+    mAdj_fit_age    <- lvcm_fit2$coefficients[,-c(1:2)]
+    mAdj_age        <- as.matrix(mAdj_in_age) - mAdj_fit_age %*% t(lvcm_design[,-c(1:2)])
+    betaAdj_age     <- ilogit2(mAdj_age)
+    rm(mAdj_in_age,mAdj_fit_age,mAdj_age); gc()
+  } else {
+    betaAdj_age     <- minfi::getBeta(lvcm_in)
+  }
+  
+  # Filter Results 
+  lvcm_filter       <- topTable(fit           = lvcm_fit2,
+                                coef          = 2,
+                                p.value       = 0.001,
+                                number        = Inf,
+                                adjust.method = "none",
+                                sort.by       = "P") %>% 
+                       add_rownames("CpG") %>% 
+                       left_join(annotation, by = c("CpG" = "Name"))
+  return(lvcm_filter)
+}
+```
+
+
+
+
+# All Hip Samples
+```{r age_reg_hip_all}
+# Fit Model
+lvcm_sample   <- "Hip_All"
+lvcm_in       <- norm_data_f[,grep("Lesioned_OA_Hip|Preserved_Control_Hip|Preserved_OA_Hip", 
+                                   pData(norm_data_f)$SampleType)]
+hip_all       <- get_age_reg(lvcm_sample, lvcm_in)
+```
+
+
+# All Knee Samples
+```{r age_reg_knee_all}
+# Fit Model
+lvcm_sample   <- "Knee_All"
+lvcm_in       <- norm_data_f[,grep("Preserved_OA_Knee|Lesioned_OA_Knee", 
+                                   pData(norm_data_f)$SampleType)]
+knee_all      <- get_age_reg(lvcm_sample, lvcm_in)
+```
+
+
+
+# All OA Samples
+```{r age_reg_oa_all}
+# Fit Model
+lvcm_sample   <- "OA_All"
+lvcm_in       <- norm_data_f[,grep("Preserved_OA_Knee|Lesioned_OA_Knee|Lesioned_OA_Hip|Preserved_OA_Hip", 
+                                   pData(norm_data_f)$SampleType)]
+oa_all        <- get_age_reg(lvcm_sample, lvcm_in)
+```
+
+
+# All Samples
+```{r age_reg_all}
+# Fit Model
+lvcm_sample   <- "All"
+oa_all        <- get_age_reg(lvcm_sample, norm_data_f)
+```
+
+
